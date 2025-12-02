@@ -43,11 +43,28 @@ def cal_hash(input_string):
 
 def get_wr_skey():
     """刷新cookie密钥"""
-    response = requests.post(RENEW_URL, headers=headers, cookies=cookies,
-                             data=json.dumps(COOKIE_DATA, separators=(',', ':')))
-    for cookie in response.headers.get('Set-Cookie', '').split(';'):
-        if "wr_skey" in cookie:
-            return cookie.split('=')[-1][:8]
+    response = requests.post(
+        RENEW_URL,
+        headers=headers,
+        cookies=cookies,
+        data=json.dumps(COOKIE_DATA, separators=(',', ':')),
+    )
+
+    # 优先使用 requests 解析后的 cookies，避免解析 Set-Cookie 时出现格式误判
+    wr_skey = response.cookies.get("wr_skey")
+    if wr_skey:
+        return wr_skey[:8]
+
+    # 兜底解析 Set-Cookie，方便排查返回格式差异
+    for cookie in response.headers.get("Set-Cookie", "").split(","):
+        if "wr_skey=" in cookie:
+            return cookie.split("wr_skey=")[-1].split(";")[0][:8]
+
+    logging.error(
+        "❌ 未能在续签响应中找到 wr_skey，status=%s, body=%s",
+        response.status_code,
+        response.text,
+    )
     return None
 
 def fix_no_synckey():
