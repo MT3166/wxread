@@ -1,4 +1,5 @@
 # main.py 主逻辑：包括字段拼接、模拟请求
+import os
 import re
 import json
 import time
@@ -16,10 +17,31 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)-8s - 
 
 # 加密盐及其它默认值
 KEY = "3c5c8717f3daf09iop3423zafeqoi"
-COOKIE_DATA = {"rq": "%2Fweb%2Fbook%2Fread","ql": True}
 READ_URL = "https://weread.qq.com/web/book/read"
 RENEW_URL = "https://weread.qq.com/web/login/renewal"
 FIX_SYNCKEY_URL = "https://weread.qq.com/web/book/chapterInfos"
+
+
+def _str_to_bool(value):
+    """统一处理布尔配置字符串"""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "t", "yes"}
+
+
+def _build_cookie_payload():
+    """构造续签请求体，兼容 weread-bot 的配置方式"""
+    env_flag = os.getenv("HACK_COOKIE_REFRESH_QL")
+    if env_flag is not None:
+        ql_flag = _str_to_bool(env_flag)
+    else:
+        ql_flag = _str_to_bool(cookies.get("wr_ql"))
+
+    payload = {"rq": "%2Fweb%2Fbook%2Fread", "ql": ql_flag}
+    logging.debug("🔧 续签 payload: %s", payload)
+    return payload
 
 
 def encode_data(data):
@@ -41,48 +63,62 @@ def cal_hash(input_string):
 
     return hex(_7032f5 + _cc1055)[2:].lower()
 
-def get_wr_skey():
-    """刷新cookie密钥"""
-    response = requests.post(
-        RENEW_URL,
-        headers=headers,
-        cookies=cookies,
-        data=json.dumps(COOKIE_DATA, separators=(',', ':')),
-    )
+def _refresh_cookie_once():
+    """调用续签接口刷新 wr_skey，成功返回 True"""
+    logging.info("🍪 刷新cookie...")
+    payload = _build_cookie_payload()
+    try:
+        response = requests.post(
+            RENEW_URL,
+            headers=headers,
+            cookies=cookies,
+            json=payload,
+            timeout=10,
+        )
+    except requests.RequestException as exc:
+        logging.error("❌ Cookie刷新失败，请求异常：%s", exc)
+        return False
 
-    # 优先使用 requests 解析后的 cookies，避免解析 Set-Cookie 时出现格式误判
-    wr_skey = response.cookies.get("wr_skey")
-    if wr_skey:
-        return wr_skey[:8]
+    new_skey = response.cookies.get("wr_skey")
 
-    # 兜底解析 Set-Cookie，方便排查返回格式差异
-    for cookie in response.headers.get("Set-Cookie", "").split(","):
-        if "wr_skey=" in cookie:
-            return cookie.split("wr_skey=")[-1].split(";")[0][:8]
+    if not new_skey:
+        set_cookie = response.headers.get("Set-Cookie", "")
+        for cookie in set_cookie.split(','):
+            if "wr_skey" in cookie:
+                parts = cookie.split(';')[0]
+                if '=' in parts:
+                    new_skey = parts.split('=', 1)[1].strip()
+                    break
 
-    logging.error(
-        "❌ 未能在续签响应中找到 wr_skey，status=%s, body=%s",
-        response.status_code,
-        response.text,
-    )
-    return None
+    if not new_skey:
+        logging.error(
+            "❌ Cookie刷新失败，未找到 wr_skey，status=%s, body=%s",
+            response.status_code,
+            response.text,
+        )
+        return False
+
+    cookies['wr_skey'] = new_skey
+    logging.info("✅ Cookie刷新成功，新密钥: %s***", new_skey[:8])
+    return True
 
 def fix_no_synckey():
     requests.post(FIX_SYNCKEY_URL, headers=headers, cookies=cookies,
                              data=json.dumps({"bookIds":["3300060341"]}, separators=(',', ':')))
 
 def refresh_cookie():
-    logging.info(f"🍪 刷新cookie")
-    new_skey = get_wr_skey()
-    if new_skey:
-        cookies['wr_skey'] = new_skey
-        logging.info(f"✅ 密钥刷新成功，新密钥：{new_skey}")
-        logging.info(f"🔄 重新本次阅读。")
-    else:
-        ERROR_CODE = "❌ 无法获取新密钥或者WXREAD_CURL_BASH配置有误，终止运行。"
-        logging.error(ERROR_CODE)
+    if _refresh_cookie_once():
+        logging.info("🔄 重新本次阅读。")
+        return
+
+    ERROR_CODE = "❌ 无法获取新密钥或者WXREAD_CURL_BASH配置有误，终止运行。"
+    logging.error(ERROR_CODE)
+    try:
         push(ERROR_CODE, PUSH_METHOD)
-        raise Exception(ERROR_CODE)
+    except Exception:
+        logging.exception("❌ 推送通知失败，请检查 PUSH_METHOD 及其配置。")
+        raise
+    raise Exception(ERROR_CODE)
 
 refresh_cookie()
 index = 1
